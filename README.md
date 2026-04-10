@@ -87,11 +87,12 @@ cmake --build build -j4
 
 ## Run
 
-### Hardware mode (with Arduino + ZED camera)
+### Hardware mode (with MCU + ZED camera)
 
 ```bash
-# Flash Arduino firmware first
-./scripts/flash_firmware.sh /dev/ttyACM0
+# Flash firmware — choose your board:
+./scripts/flash_firmware.sh                  # Arduino Uno
+./scripts/flash_firmware.sh --esp32          # M5StickC Plus 2
 
 # Set Jetson to max performance
 sudo nvpmodel -m 0 && sudo jetson_clocks
@@ -161,6 +162,8 @@ GPU memory: 603.8 KB
 
 ## Circuit Connection Diagram
 
+### Option A: Arduino Uno
+
 ```
                         ┌─────────────────────────────────┐
                         │       ZED Stereo Camera          │
@@ -170,42 +173,55 @@ GPU memory: 603.8 KB
                         └──────────┬──────────────────────┘
                                    │ USB 3.0
 ┌──────────────────────────────────┼──────────────────────────────────┐
-│  JETSON NANO 2GB / ORIN NANO     │                                  │
-│  ┌─────────────────────────────┐ │                                  │
-│  │ GPU: 128 cores (sm_53)     │ │  ┌──────────────────────────┐    │
-│  │ CPU: 4x A57                │ │  │  Power                    │    │
-│  │ RAM: 2 GB                  │ │  │  5V/3A barrel jack       │    │
-│  └─────────────────────────────┘ │  └──────────────────────────┘    │
-│                                  │                                  │
+│  JETSON NANO 2GB                 │                                  │
 │  USB 3.0 ←───────────────────────┘                                  │
 │  USB 2.0 ←──────────────────────────────────────┐                   │
 └─────────────────────────────────────────────────┼───────────────────┘
                                                   │ USB Serial
 ┌─────────────────────────────────────────────────┼───────────────────┐
 │  ARDUINO UNO (ATmega328P, 16 MHz)               │                   │
-│                                                  │                   │
 │  ┌──────────┐    I2C (A4=SDA, A5=SCL)    ┌──────┴──────┐           │
 │  │ BNO085   │◄──────────────────────────►│ USB Serial  │           │
 │  │ IMU      │    400 kHz, addr 0x4A      │ 115200 baud │           │
-│  │ 3.3V/GND │                            └─────────────┘           │
-│  └──────────┘                                                       │
-│                                                                     │
-│  D2 (INT0) ◄──── Left Wheel Encoder ──── Signal + VCC + GND       │
-│  D3 (INT1) ◄──── Right Wheel Encoder ─── Signal + VCC + GND       │
-│                                                                     │
-│  D9  (PWM) ────► Steering Servo ───────── PWM 1000-2000us          │
-│  D10 (PWM) ────► ESC (Throttle) ───────── PWM 1000-2000us          │
-│  D7  (OUT) ────► Run-Stop Relay ───────── HIGH=STOP, LOW=RUN       │
-│                                                                     │
-│  5V  ◄──────── BEC (Battery Eliminator) ◄──── LiPo Battery        │
-│  GND ◄──────── Common Ground ◄───────────────────────┘             │
+│  └──────────┘                            └─────────────┘           │
+│  D2 (INT0) ◄──── Left Wheel Encoder                                │
+│  D3 (INT1) ◄──── Right Wheel Encoder                               │
+│  D9  (PWM) ────► Steering Servo (1000-2000us)                      │
+│  D10 (PWM) ────► ESC/Throttle  (1000-2000us)                      │
+│  D7  (OUT) ────► Run-Stop Relay (HIGH=STOP)                        │
 └─────────────────────────────────────────────────────────────────────┘
+```
 
-Power Distribution:
+### Option B: M5StickC Plus 2 (ESP32)
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  JETSON NANO 2GB                                                     │
+│  USB 3.0 ←──── ZED Stereo Camera                                    │
+│  USB 2.0 ←──────────────────────────────────────┐                    │
+└─────────────────────────────────────────────────┼────────────────────┘
+                                                  │ USB-C Serial
+┌─────────────────────────────────────────────────┼────────────────────┐
+│  M5StickC Plus 2 (ESP32, 240 MHz)               │                    │
+│  ┌──────────┐  ┌─────────┐               ┌─────┴──────┐            │
+│  │ MPU6886  │  │ 1.14"   │               │ USB-C      │            │
+│  │ (built-in│  │ TFT     │               │ 115200 baud│            │
+│  │ 6-axis)  │  │ Display │               └────────────┘            │
+│  └──────────┘  └─────────┘                                          │
+│  Grove: G32/G33 (I2C) ◄──► BNO085 IMU (addr 0x4A)                  │
+│  HAT:   G26  ◄──── Left Wheel Encoder (interrupt)                   │
+│         G36  ◄──── Right Wheel Encoder (input-only interrupt)       │
+│         G0   ────► Steering Servo PWM                               │
+│         G25  ────► ESC/Throttle PWM                                 │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+```
+Power Distribution (both options):
   LiPo Battery (2S-3S, 7.4-11.1V)
     ├──► ESC ──► Brushless Motor
-    ├──► BEC (5V regulated) ──► Arduino 5V + Servo + Encoders
-    └──► Jetson Nano (via barrel jack adapter or USB-C PD)
+    ├──► BEC (5V regulated) ──► MCU + Servo + Encoders
+    └──► Jetson Nano (via barrel jack or USB-C PD)
 ```
 
 See [docs/Circuit-Diagram.md](docs/Circuit-Diagram.md) for Mermaid diagram and SchemeIt component list.
@@ -221,7 +237,10 @@ truggy/
 │   ├── planning/             # MPPI controller, dynamics NN, cost functions (CUDA)
 │   ├── state/                # 7-state EKF, IMU utilities
 │   └── actuation/            # Arduino serial bridge
-├── firmware/truggy_bridge/   # Arduino Uno firmware (pure C)
+├── firmware/
+│   ├── common/protocol.h    # Shared binary protocol (CRC-8, packet format)
+│   ├── truggy_bridge/       # Arduino Uno firmware
+│   └── truggy_bridge_esp32/ # M5StickC Plus 2 firmware
 ├── config/                   # truggy.yaml, mppi_costs.yaml
 ├── sim/gazebo/               # Gazebo Harmonic SDF models
 ├── scripts/                  # run.sh, remote-build.sh, flash_firmware.sh
@@ -247,6 +266,31 @@ Key parameters in `config/truggy.yaml`:
 | `costmap.cell_size` | 0.05 m | BEV grid resolution |
 | `vehicle.wheelbase` | 0.35 m | 1/8 scale truggy |
 
+## Firmware
+
+Two MCU firmware options sharing the same binary serial protocol (`firmware/common/protocol.h`). The Jetson-side bridge works unchanged with either board.
+
+| Board | Firmware | Pros | Cons |
+|-------|----------|------|------|
+| **Arduino Uno** | `firmware/truggy_bridge/` | 5V logic, simple, proven | 2KB RAM, no display |
+| **M5StickC Plus 2** | `firmware/truggy_bridge_esp32/` | 240MHz, 520KB RAM, TFT display, WiFi, built-in MPU6886 | 3.3V logic, limited GPIO (6 pins) |
+
+```bash
+./scripts/flash_firmware.sh              # Arduino Uno (default)
+./scripts/flash_firmware.sh --esp32      # M5StickC Plus 2
+```
+
+### ESP32 Pin Mapping (M5StickC Plus 2)
+
+| Pin | Function | Connector |
+|-----|----------|-----------|
+| G32 | BNO085 I2C SDA | Grove |
+| G33 | BNO085 I2C SCL | Grove |
+| G26 | Wheel Encoder L (INT) | HAT |
+| G36 | Wheel Encoder R (input-only INT) | HAT |
+| G0 | Steering Servo PWM | HAT |
+| G25 | ESC Throttle PWM | HAT |
+
 ## Hardware BOM
 
 | Component | Model | Interface | Purpose |
@@ -254,10 +298,11 @@ Key parameters in `config/truggy.yaml`:
 | Compute | Jetson Nano 2GB | — | Main computer (128 CUDA cores) |
 | Camera | ZED Stereo | USB 3.0 | Depth + VIO + RGB |
 | IMU | BNO085 | I2C (0x4A) | Quaternion + accel + gyro |
-| MCU | Arduino Uno | USB Serial | Sensor hub + PWM output |
+| MCU (option A) | Arduino Uno | USB Serial | Sensor hub + PWM output |
+| MCU (option B) | M5StickC Plus 2 | USB Serial | Sensor hub + PWM + TFT display |
 | Encoders | Optical x2 | Digital INT | Wheel speed measurement |
-| Servo | RC Steering | PWM (D9) | Steering control |
-| ESC | Brushless | PWM (D10) | Throttle control |
+| Servo | RC Steering | PWM | Steering control |
+| ESC | Brushless | PWM | Throttle control |
 | Battery | LiPo 2S-3S | — | Power source |
 | Chassis | TLR 1/8 Truggy | — | Vehicle platform |
 
