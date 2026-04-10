@@ -2,6 +2,7 @@
 #include "common/config.h"
 #include "common/timing.h"
 #include "actuation/bridge.h"
+#include "planning/mppi.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -40,14 +41,14 @@ static void* perception_thread(void* arg) {
     return nullptr;
 }
 
+struct thread_args_t {
+    shared_bus_t* bus;
+    config_t* cfg;
+};
+
 static void* planning_thread(void* arg) {
-    auto* bus = (shared_bus_t*)arg;
-    fprintf(stderr, "[T1] Planning thread started\n");
-    // TODO(epic4): call planning_loop(bus, cfg)
-    while (bus->alive.load(std::memory_order_relaxed)) {
-        sleep_until_us(now_us() + 20000);  // ~50 Hz placeholder
-    }
-    fprintf(stderr, "[T1] Planning thread stopped\n");
+    auto* ta = (thread_args_t*)arg;
+    planning_loop(ta->bus, *ta->cfg);
     return nullptr;
 }
 
@@ -61,11 +62,6 @@ static void* state_estimation_thread(void* arg) {
     fprintf(stderr, "[T2] State estimation thread stopped\n");
     return nullptr;
 }
-
-struct thread_args_t {
-    shared_bus_t* bus;
-    config_t* cfg;
-};
 
 static void* actuation_thread(void* arg) {
     auto* ta = (thread_args_t*)arg;
@@ -189,7 +185,7 @@ int main(int argc, char** argv) {
     set_thread_affinity(t0, 3);
 
     // T1: Planning (highest priority)
-    pthread_create(&t1, nullptr, planning_thread, bus);
+    pthread_create(&t1, nullptr, planning_thread, &ta);
     set_thread_affinity(t1, 0);
     set_thread_priority(t1, 90);
 
