@@ -101,6 +101,46 @@ sudo nvpmodel -m 0 && sudo jetson_clocks
 ./build/truggy --config config/truggy.yaml --costs config/mppi_costs.yaml
 ```
 
+### RC Mode Control (Futaba 7PX)
+
+The Futaba 7PX transmitter controls the auto/manual mode via a 3-position switch on CH3.
+
+```
+Futaba 7PX ─── (2.4GHz) ──► Receiver ──► Arduino Uno / M5StickC Plus 2
+                                            │
+                              CH1 (D4) ── Steering PWM
+                              CH2 (D5) ── Throttle PWM
+                              CH3 (D6) ── Mode Switch
+                                            │
+                  ┌─────────────────────────┼─────────────────────────┐
+                  ▼                         ▼                         ▼
+            CH3 < 1300us              1300-1700us                CH3 > 1700us
+              MANUAL                  (deadband)                    AUTO
+          RC → Servo directly        keep last mode          Jetson MPPI → Servo
+```
+
+| Mode | Source | Servo Control | Run-Stop | When |
+|------|--------|---------------|----------|------|
+| **MANUAL** | Futaba 7PX | RC PWM passthrough | RUN | CH3 switch DOWN |
+| **AUTO** | Jetson MPPI | Serial commands | Armed by Jetson | CH3 switch UP |
+| **FAILSAFE** | — | Neutral (1500us) | STOP | No RC signal > 500ms |
+
+**Safety priority:** FAILSAFE > MANUAL override > AUTO
+
+**Arduino Uno wiring:**
+| Receiver CH | Arduino Pin | Function |
+|-------------|-------------|----------|
+| CH1 | D4 | Steering PWM input |
+| CH2 | D5 | Throttle PWM input |
+| CH3 | D6 | Mode switch input |
+
+**M5StickC Plus 2** (limited GPIO, no RC PWM reading):
+- **BtnA** press: toggle MANUAL / AUTO mode
+- **BtnB** hold: force FAILSAFE (emergency stop)
+- TFT display shows current mode in large colored text
+
+**Telemetry (v2, 28 bytes):** Drive mode, RC steering, and RC throttle are included in every telemetry packet so the Jetson always knows the current state. The EKF and MPPI run continuously in both modes, ready for instant switchover.
+
 ### Simulation mode (no hardware needed)
 
 ```bash
@@ -186,9 +226,12 @@ GPU memory: 603.8 KB
 │  └──────────┘                            └─────────────┘           │
 │  D2 (INT0) ◄──── Left Wheel Encoder                                │
 │  D3 (INT1) ◄──── Right Wheel Encoder                               │
+│  D4  (IN)  ◄──── Futaba Receiver CH1 (steering PWM)               │
+│  D5  (IN)  ◄──── Futaba Receiver CH2 (throttle PWM)               │
+│  D6  (IN)  ◄──── Futaba Receiver CH3 (auto/manual switch)         │
+│  D7  (OUT) ────► Run-Stop Relay (HIGH=STOP)                        │
 │  D9  (PWM) ────► Steering Servo (1000-2000us)                      │
 │  D10 (PWM) ────► ESC/Throttle  (1000-2000us)                      │
-│  D7  (OUT) ────► Run-Stop Relay (HIGH=STOP)                        │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
