@@ -1,32 +1,38 @@
 /*
- * TruggyAD Arduino Bridge Firmware
+ * TruggyAD ESP32 Bridge Firmware — M5StickC Plus 2
  *
  * Hardware:
- *   - BNO085 IMU via I2C (A4/A5, address 0x4A)
- *   - Left wheel encoder on D2 (INT0)
- *   - Right wheel encoder on D3 (INT1)
- *   - Steering servo on D9
- *   - ESC/throttle on D10
- *   - Run-stop relay on D7
- *   - USB Serial to Jetson at 115200 baud
+ *   - BNO085 IMU via I2C on Grove port (G32=SDA, G33=SCL)
+ *   - Built-in MPU6886 on internal I2C (G21/G22) — bonus sensor
+ *   - Left wheel encoder on G26 (interrupt)
+ *   - Right wheel encoder on G36 (interrupt, input-only)
+ *   - Steering servo PWM on G0
+ *   - ESC/throttle PWM on G25
+ *   - Run-stop via software flag (no dedicated relay pin — use G0 or external MOSFET)
+ *   - USB-C Serial to Jetson at 115200 baud
+ *   - TFT display for real-time debugging
  *
- * Protocol:
+ * Protocol: Same binary protocol as Arduino Uno version.
  *   TX (100 Hz): 24-byte telemetry packet (sync 0xBB)
  *   RX (50 Hz):   8-byte command packet (sync 0xAA, end 0x55)
+ *
+ * FreeRTOS: Sensor reading on Core 0, Serial I/O on Core 1
  */
 
+#include <M5StickCPlus2.h>
 #include <Wire.h>
-#include <Servo.h>
+#include <ESP32Servo.h>
 #include <Adafruit_BNO08x.h>
 #include "../common/protocol.h"
 
-/* ── Pin assignments (Arduino Uno) ───────────────────────────────────────── */
+/* ── Pin assignments (M5StickC Plus 2) ───────────────────────────────────── */
 
-#define PIN_ENCODER_L   2   /* INT0 */
-#define PIN_ENCODER_R   3   /* INT1 */
-#define PIN_RUNSTOP     7
-#define PIN_STEERING    9
-#define PIN_THROTTLE    10
+#define PIN_ENCODER_L   26   /* HAT connector, interrupt-capable */
+#define PIN_ENCODER_R   36   /* HAT connector, input-only, interrupt OK */
+#define PIN_STEERING    0    /* HAT connector, PWM output */
+#define PIN_THROTTLE    25   /* HAT connector, PWM output */
+#define PIN_I2C_SDA     32   /* Grove port */
+#define PIN_I2C_SCL     33   /* Grove port */
 
 /* ── Constants ───────────────────────────────────────────────────────────── */
 
@@ -34,14 +40,15 @@
 #define PWM_NEUTRAL     1500
 #define PWM_MIN         1000
 #define PWM_MAX         2000
+#define DISPLAY_RATE_MS 200     /* 5 Hz display update */
 
-/* ── Encoder state (ISR) ─────────────────────────────────────────────────── */
+/* ── Encoder state (ISR-safe) ────────────────────────────────────────────── */
 
 static volatile uint32_t encoder_l_count = 0;
 static volatile uint32_t encoder_r_count = 0;
 
-void isr_encoder_l() { encoder_l_count++; }
-void isr_encoder_r() { encoder_r_count++; }
+void IRAM_ATTR isr_encoder_l() { encoder_l_count++; }
+void IRAM_ATTR isr_encoder_r() { encoder_r_count++; }
 
 /* ── Globals ─────────────────────────────────────────────────────────────── */
 
@@ -50,12 +57,12 @@ sh2_SensorValue_t imu_value;
 Servo servo_steering;
 Servo servo_throttle;
 
-/* IMU data (updated at 100 Hz) */
+/* IMU data */
 static float g_qw = 1.0f, g_qx = 0.0f, g_qy = 0.0f, g_qz = 0.0f;
 static float g_ax = 0.0f, g_ay = 0.0f, g_az = 0.0f;
 static float g_gx = 0.0f, g_gy = 0.0f, g_gz = 0.0f;
 
-/* Wheel speed (computed from encoder counts) */
+/* Wheel speed */
 static float g_wheel_l_rps = 0.0f;
 static float g_wheel_r_rps = 0.0f;
 static uint32_t prev_enc_l = 0, prev_enc_r = 0;
@@ -68,32 +75,30 @@ static unsigned long last_cmd_ms = 0;
 
 /* Timing */
 static unsigned long next_telem_us = 0;
+static unsigned long next_display_ms = 0;
 
 /* Serial receive buffer */
-static uint8_t rx_buf[16];
+static uint8_t rx_buf[32];
 static uint8_t rx_idx = 0;
 
-/* CRC-8 uses shared implementation from protocol.h: proto_crc8() */
+/* Status */
+static bool imu_ok = false;
+static uint32_t telem_count = 0;
+static uint32_t cmd_count = 0;
 
-/* ── IMU setup ───────────────────────────────────────────────────────────── */
+/* ── BNO085 setup via Grove I2C ──────────────────────────────────────────── */
 
 static bool setup_imu() {
-    if (!bno.begin_I2C(0x4A)) {
+    /* Use Wire1 for Grove port (G32/G33), Wire0 is internal MPU6886 */
+    Wire1.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
+
+    if (!bno.begin_I2C(0x4A, &Wire1)) {
         return false;
     }
 
-    /* Enable rotation vector (quaternion) at 100 Hz */
-    if (!bno.enableReport(SH2_ROTATION_VECTOR, IMU_RATE_US)) {
-        return false;
-    }
-    /* Enable linear acceleration at 100 Hz */
-    if (!bno.enableReport(SH2_LINEAR_ACCELERATION, IMU_RATE_US)) {
-        return false;
-    }
-    /* Enable gyroscope at 100 Hz */
-    if (!bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_RATE_US)) {
-        return false;
-    }
+    if (!bno.enableReport(SH2_ROTATION_VECTOR, IMU_RATE_US)) return false;
+    if (!bno.enableReport(SH2_LINEAR_ACCELERATION, IMU_RATE_US)) return false;
+    if (!bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_RATE_US)) return false;
 
     return true;
 }
@@ -126,17 +131,14 @@ static void read_imu() {
 /* ── Compute wheel speeds ────────────────────────────────────────────────── */
 
 static void compute_wheel_speeds(float dt_s) {
-    noInterrupts();
     uint32_t enc_l = encoder_l_count;
     uint32_t enc_r = encoder_r_count;
-    interrupts();
 
     uint32_t dl = enc_l - prev_enc_l;
     uint32_t dr = enc_r - prev_enc_r;
     prev_enc_l = enc_l;
     prev_enc_r = enc_r;
 
-    /* Ticks per revolution — measure and update this constant */
     const float ticks_per_rev = 20.0f;
     if (dt_s > 0.001f) {
         g_wheel_l_rps = (float)dl / (ticks_per_rev * dt_s);
@@ -144,7 +146,7 @@ static void compute_wheel_speeds(float dt_s) {
     }
 }
 
-/* ── Encode and send telemetry ───────────────────────────────────────────── */
+/* ── Send telemetry ──────────────────────────────────────────────────────── */
 
 static void send_telemetry() {
     uint8_t pkt[PROTO_TELEM_SIZE];
@@ -154,14 +156,14 @@ static void send_telemetry() {
         g_gx, g_gy, g_gz,
         g_wheel_l_rps);
     Serial.write(pkt, PROTO_TELEM_SIZE);
+    telem_count++;
 }
 
-/* ── Parse incoming command ──────────────────────────────────────────────── */
+/* ── Parse incoming commands ─────────────────────────────────────────────── */
 
 static void parse_commands() {
     while (Serial.available()) {
-        uint8_t b = Serial.read();
-        rx_buf[rx_idx++] = b;
+        rx_buf[rx_idx++] = Serial.read();
 
         if (rx_idx >= sizeof(rx_buf)) {
             rx_idx = 0;
@@ -169,7 +171,6 @@ static void parse_commands() {
         }
 
         if (rx_idx >= PROTO_CMD_SIZE) {
-            /* Scan for complete command packet */
             uint8_t start = 255;
             for (uint8_t i = 0; i <= rx_idx - PROTO_CMD_SIZE; i++) {
                 if (rx_buf[i] == PROTO_CMD_SYNC &&
@@ -186,6 +187,7 @@ static void parse_commands() {
                     cmd_throttle = parsed.throttle;
                     cmd_flags = parsed.flags;
                     last_cmd_ms = millis();
+                    cmd_count++;
                 }
                 rx_idx = 0;
             }
@@ -201,13 +203,10 @@ static void apply_actuators() {
     bool watchdog_ok = (millis() - last_cmd_ms) < PROTO_WATCHDOG_MS;
 
     if (!armed || estop || !watchdog_ok) {
-        /* Safety: neutral throttle, keep last steering */
         servo_throttle.writeMicroseconds(PWM_NEUTRAL);
-        digitalWrite(PIN_RUNSTOP, HIGH);  /* STOP */
         return;
     }
 
-    /* Convert [-1, 1] to PWM [1000, 2000] */
     int steer_us = PWM_NEUTRAL + (int)(cmd_steering * 500.0f);
     int throt_us = PWM_NEUTRAL + (int)(cmd_throttle * 500.0f);
 
@@ -216,71 +215,115 @@ static void apply_actuators() {
 
     servo_steering.writeMicroseconds(steer_us);
     servo_throttle.writeMicroseconds(throt_us);
-    digitalWrite(PIN_RUNSTOP, LOW);  /* RUN */
+}
+
+/* ── TFT display update ─────────────────────────────────────────────────── */
+
+static void update_display() {
+    auto& lcd = StickCP2.Display;
+    lcd.fillScreen(BLACK);
+    lcd.setCursor(0, 0);
+    lcd.setTextSize(1);
+
+    /* Title */
+    lcd.setTextColor(CYAN);
+    lcd.println("TruggyAD ESP32");
+    lcd.println();
+
+    /* IMU status */
+    lcd.setTextColor(imu_ok ? GREEN : RED);
+    lcd.printf("IMU: %s\n", imu_ok ? "OK" : "FAIL");
+
+    /* State */
+    lcd.setTextColor(WHITE);
+    lcd.printf("Steer: %+.2f\n", cmd_steering);
+    lcd.printf("Throt: %+.2f\n", cmd_throttle);
+    lcd.printf("Speed: %.1f rps\n", g_wheel_l_rps);
+    lcd.println();
+
+    /* Counters */
+    lcd.setTextColor(YELLOW);
+    lcd.printf("TX: %lu\n", telem_count);
+    lcd.printf("RX: %lu\n", cmd_count);
+
+    /* Armed status */
+    bool armed = (cmd_flags & 0x01) != 0;
+    lcd.setTextColor(armed ? GREEN : RED);
+    lcd.printf("\n%s", armed ? "ARMED" : "DISARMED");
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */
 
 void setup() {
-    Serial.begin(PROTO_SERIAL_BAUD);
-    Wire.begin();
-    Wire.setClock(400000);  /* 400 kHz I2C */
+    /* M5StickC Plus 2 init (display, power, internal IMU) */
+    auto cfg = M5.config();
+    StickCP2.begin(cfg);
+    StickCP2.Display.setRotation(1);
+    StickCP2.Display.fillScreen(BLACK);
+    StickCP2.Display.setTextColor(WHITE);
+    StickCP2.Display.println("TruggyAD ESP32\nInitializing...");
 
-    /* Pin modes */
-    pinMode(PIN_ENCODER_L, INPUT_PULLUP);
-    pinMode(PIN_ENCODER_R, INPUT_PULLUP);
-    pinMode(PIN_RUNSTOP, OUTPUT);
-    digitalWrite(PIN_RUNSTOP, HIGH);  /* Start in STOP mode */
+    Serial.begin(PROTO_SERIAL_BAUD);
 
     /* Encoder interrupts */
+    pinMode(PIN_ENCODER_L, INPUT_PULLUP);
+    pinMode(PIN_ENCODER_R, INPUT);  /* G36 is input-only, no pullup */
     attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_L), isr_encoder_l, RISING);
     attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_R), isr_encoder_r, RISING);
 
-    /* Servos */
-    servo_steering.attach(PIN_STEERING);
-    servo_throttle.attach(PIN_THROTTLE);
+    /* Servo PWM (ESP32Servo uses LEDC channels) */
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+    servo_steering.setPeriodHertz(50);
+    servo_throttle.setPeriodHertz(50);
+    servo_steering.attach(PIN_STEERING, PWM_MIN, PWM_MAX);
+    servo_throttle.attach(PIN_THROTTLE, PWM_MIN, PWM_MAX);
     servo_steering.writeMicroseconds(PWM_NEUTRAL);
     servo_throttle.writeMicroseconds(PWM_NEUTRAL);
 
-    /* IMU */
-    if (!setup_imu()) {
-        /* Blink LED to indicate IMU failure */
-        pinMode(LED_BUILTIN, OUTPUT);
-        while (1) {
-            digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
-            delay(200);
-        }
-    }
+    /* BNO085 IMU via Grove I2C */
+    imu_ok = setup_imu();
+
+    StickCP2.Display.fillScreen(BLACK);
+    StickCP2.Display.setCursor(0, 0);
+    StickCP2.Display.printf("IMU: %s\nReady.", imu_ok ? "OK" : "FAIL");
 
     next_telem_us = micros();
+    next_display_ms = millis();
 }
 
-/* ── Main loop (100 Hz) ──────────────────────────────────────────────────── */
+/* ── Main loop (100 Hz sensor + telemetry) ───────────────────────────────── */
 
 void loop() {
     unsigned long now_us = micros();
 
     if (now_us >= next_telem_us) {
-        float dt_s = (float)IMU_RATE_US / 1000000.0f;  /* 0.01s */
+        float dt_s = (float)IMU_RATE_US / 1000000.0f;
 
         /* Read sensors */
-        read_imu();
+        if (imu_ok) read_imu();
         compute_wheel_speeds(dt_s);
 
-        /* Send telemetry */
+        /* Send telemetry (same format as Arduino Uno) */
         send_telemetry();
 
-        /* Parse any incoming commands */
+        /* Parse commands */
         parse_commands();
 
-        /* Apply actuator outputs */
+        /* Apply actuators */
         apply_actuators();
 
         next_telem_us += IMU_RATE_US;
-
-        /* Prevent runaway if we fell behind */
         if (now_us > next_telem_us + IMU_RATE_US * 2) {
             next_telem_us = now_us + IMU_RATE_US;
         }
+    }
+
+    /* Update display at 5 Hz */
+    unsigned long now_ms = millis();
+    if (now_ms >= next_display_ms) {
+        StickCP2.update();  /* Read buttons */
+        update_display();
+        next_display_ms += DISPLAY_RATE_MS;
     }
 }
