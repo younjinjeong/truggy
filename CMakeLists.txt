@@ -39,6 +39,7 @@ endif()
 
 # ── CUDA flags ───────────────────────────────────────────────────────────────
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --maxrregcount=32 -use_fast_math")
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)  # needed for cross-file __device__ calls
 add_compile_definitions(MPPI_NNET_USING_CONSTANT_MEM__)
 
 # ── Compiler flags ───────────────────────────────────────────────────────────
@@ -142,6 +143,19 @@ if(BUILD_TOOLS)
     add_executable(serial_test tools/serial_test.cpp src/common/serial.cpp)
     target_include_directories(serial_test PRIVATE src)
     target_link_libraries(serial_test PRIVATE Threads::Threads)
+
+    add_executable(mppi_bench
+        tools/mppi_bench.cu
+        src/planning/mppi.cu
+        src/planning/dynamics.cu
+        src/planning/costs.cu
+    )
+    target_include_directories(mppi_bench PRIVATE src)
+    target_link_libraries(mppi_bench PRIVATE
+        CUDA::curand
+        CUDA::cudart
+        cnpy
+    )
 endif()
 
 # ── Export compile_commands.json for clangd ───────────────────────────────────
