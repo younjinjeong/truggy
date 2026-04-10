@@ -50,38 +50,19 @@ Byte   Field         Type     Scale     Description
  5-6   qy            int16    * 10000   Quaternion y
  7-8   qz            int16    * 10000   Quaternion z
  9-10  ax            int16    * 1000    Accel X (m/s^2)
- 11-12 ay            int16    * 1000    Accel Y (m/s^2)
- 13-14 az            int16    * 1000    Accel Z (m/s^2)
- 15-16 gx            int16    * 1000    Gyro X (rad/s)
- 17-18 gy            int16    * 1000    Gyro Y (rad/s)
- 19-20 gz            int16    * 1000    Gyro Z (rad/s)
- 21-22 wheel_speeds  2x uint8 * 100    L/R wheel speed (rev/s) — see note
- 23    crc8          uint8    —         CRC-8 over bytes 1-22
-```
-
-**Note on wheel speeds (bytes 21-22):** These are 2x int16 packed into 4 bytes:
-- Bytes 21-22: left wheel (int16, speed_rps * 100)
-- Actually the telemetry is 24 bytes with the following corrected layout:
-
-```
-Byte   Field         Type     Scale     Description
-───────────────────────────────────────────────────────────────
- 0     sync          uint8    —         0xBB
- 1-2   qw            int16    * 10000   Quaternion w
- 3-4   qx            int16    * 10000   Quaternion x
- 5-6   qy            int16    * 10000   Quaternion y
- 7-8   qz            int16    * 10000   Quaternion z
- 9-10  ax            int16    * 1000    Accel X (m/s^2)
 11-12  ay            int16    * 1000    Accel Y (m/s^2)
 13-14  az            int16    * 1000    Accel Z (m/s^2)
 15-16  gx            int16    * 1000    Gyro X (rad/s)
 17-18  gy            int16    * 1000    Gyro Y (rad/s)
 19-20  gz            int16    * 1000    Gyro Z (rad/s)
-21-22  wheel_L       int16    * 100     Left wheel (rev/s)
+21-22  wheel_L       int16    * 100     Left wheel speed (rev/s)
   23   crc8          uint8    —         CRC-8 over bytes 1-22
 ```
 
 Total: 24 bytes (1 sync + 11 x int16 + 1 CRC = 1 + 22 + 1 = 24)
+
+**Note:** Only left wheel speed is transmitted (right wheel derived from differential).
+If both wheels needed, extend to 26 bytes with bytes 23-24 for right wheel and CRC at byte 25.
 
 ## CRC-8 (Dallas/Maxim)
 
