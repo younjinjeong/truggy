@@ -67,9 +67,10 @@ find_package(Threads REQUIRED)
 
 # ZED SDK (optional — skip for CI builds)
 if(NOT BUILD_WITHOUT_HARDWARE_DEPS)
-    # ZED SDK installs to /usr/local/zed
-    list(APPEND CMAKE_PREFIX_PATH "/usr/local/zed")
-    find_package(ZED 4 QUIET)
+    # ZED SDK installs to /usr/local/zed (uses custom zed-config.cmake)
+    set(ZED_DIR "/usr/local/zed" CACHE PATH "ZED SDK path")
+    set(LINK_SHARED_ZED TRUE)
+    find_package(zed QUIET PATHS "${ZED_DIR}" NO_DEFAULT_PATH)
     if(ZED_FOUND)
         message(STATUS "ZED SDK found: ${ZED_INCLUDE_DIRS}")
         add_compile_definitions(HAS_ZED_SDK)
@@ -104,6 +105,7 @@ add_executable(truggy
     src/common/serial.cpp
     src/state/ekf.cpp
     src/actuation/bridge.cpp
+    src/perception/perception.cpp
 )
 
 # CUDA sources (added separately for proper .cu compilation)
@@ -130,6 +132,7 @@ target_link_libraries(truggy PRIVATE
 # Link ZED SDK if available
 if(ZED_FOUND)
     target_include_directories(truggy PRIVATE ${ZED_INCLUDE_DIRS})
+    target_link_directories(truggy PRIVATE ${ZED_LIBRARY_DIR})
     target_link_libraries(truggy PRIVATE ${ZED_LIBRARIES})
 endif()
 
