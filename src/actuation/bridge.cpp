@@ -13,7 +13,7 @@ static constexpr uint8_t CMD_END   = 0x55;
 static constexpr int     CMD_SIZE  = 8;
 
 static constexpr uint8_t TELEM_SYNC = 0xBB;
-static constexpr int     TELEM_SIZE = 24;
+static constexpr int     TELEM_SIZE = 28;  // v2: was 24, now 28 with RC mode
 
 /* ── Telemetry parsing ───────────────────────────────────────────────────── */
 
@@ -23,10 +23,11 @@ static inline int16_t unpack16(const uint8_t* buf, int idx) {
 
 static bool parse_telemetry(const uint8_t* pkt,
                             imu_sample_t& imu, wheel_sample_t& wheels,
+                            uint8_t& drive_mode,
                             uint64_t timestamp_us) {
-    /* Verify CRC */
-    uint8_t expected = crc8(pkt + 1, 22);
-    if (pkt[23] != expected) return false;
+    /* Verify CRC (v2: bytes 1-26, CRC at byte 27) */
+    uint8_t expected = crc8(pkt + 1, 26);
+    if (pkt[27] != expected) return false;
 
     /* Quaternion (scale: /10000) */
     imu.qw = (float)unpack16(pkt, 1)  / 10000.0f;
@@ -48,8 +49,13 @@ static bool parse_telemetry(const uint8_t* pkt,
 
     /* Wheel speed (scale: /100, rev/s) */
     wheels.left_rps  = (float)unpack16(pkt, 21) / 100.0f;
-    wheels.right_rps = 0.0f;  /* single wheel in 24-byte packet */
+    wheels.right_rps = 0.0f;
     wheels.timestamp_us = timestamp_us;
+
+    /* Drive mode (v2: byte 23) */
+    drive_mode = pkt[23];
+    /* rc_steering_us = (pkt[24] << 8) | pkt[25]; — available if needed */
+    /* rc_throttle_pct = (int8_t)pkt[26]; — available if needed */
 
     return true;
 }
@@ -80,7 +86,8 @@ struct rx_state_t {
 };
 
 static int scan_telemetry(rx_state_t& rx, imu_sample_t& imu,
-                          wheel_sample_t& wheels, uint64_t ts) {
+                          wheel_sample_t& wheels, uint8_t& drive_mode,
+                          uint64_t ts) {
     int parsed = 0;
 
     while (rx.len >= TELEM_SIZE) {
@@ -111,7 +118,7 @@ static int scan_telemetry(rx_state_t& rx, imu_sample_t& imu,
 
         /* Try to parse */
         if (rx.len >= TELEM_SIZE) {
-            if (parse_telemetry(rx.buf, imu, wheels, ts)) {
+            if (parse_telemetry(rx.buf, imu, wheels, drive_mode, ts)) {
                 parsed++;
             }
             /* Consume the packet regardless of CRC result */
@@ -154,7 +161,8 @@ void actuation_loop(shared_bus_t* bus, const config_t& cfg) {
 
         imu_sample_t imu;
         wheel_sample_t wheels;
-        int parsed = scan_telemetry(rx, imu, wheels, ts);
+        uint8_t drive_mode = 0;
+        int parsed = scan_telemetry(rx, imu, wheels, drive_mode, ts);
 
         if (parsed > 0) {
             /* Write to shared bus */
@@ -164,6 +172,8 @@ void actuation_loop(shared_bus_t* bus, const config_t& cfg) {
         }
 
         /* ── Send commands to Arduino ────────────────────────────────────── */
+        /* Only send when MCU is in AUTO mode. In MANUAL/FAILSAFE,
+           MCU ignores commands anyway, but we still send arm status. */
         if (ts >= next_cmd) {
             control_2d_t ctrl = seqlock_read(bus->control_lock, bus->control);
             bool armed = bus->armed.load(std::memory_order_relaxed);

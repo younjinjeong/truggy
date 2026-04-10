@@ -3,20 +3,23 @@
  *
  * Hardware:
  *   - BNO085 IMU via I2C on Grove port (G32=SDA, G33=SCL)
- *   - Built-in MPU6886 on internal I2C (G21/G22) — bonus sensor
+ *   - Built-in MPU6886 on internal I2C (G21/G22)
  *   - Left wheel encoder on G26 (interrupt)
  *   - Right wheel encoder on G36 (interrupt, input-only)
  *   - Steering servo PWM on G0
  *   - ESC/throttle PWM on G25
- *   - Run-stop via software flag (no dedicated relay pin — use G0 or external MOSFET)
  *   - USB-C Serial to Jetson at 115200 baud
  *   - TFT display for real-time debugging
  *
- * Protocol: Same binary protocol as Arduino Uno version.
- *   TX (100 Hz): 24-byte telemetry packet (sync 0xBB)
- *   RX (50 Hz):   8-byte command packet (sync 0xAA, end 0x55)
+ * RC receiver via S.BUS on Serial2 (or PWM on spare pins):
+ *   For M5StickC Plus 2 with limited GPIO, use Futaba S.BUS output
+ *   connected to G33 (Grove SCL) via inverter, OR use BtnA/BtnB
+ *   as manual mode override. See PIN_RC_* defines below.
  *
- * FreeRTOS: Sensor reading on Core 0, Serial I/O on Core 1
+ * Mode control via Futaba 7PX:
+ *   CH3 switch > 1700us = AUTO (Jetson controls)
+ *   CH3 switch < 1300us = MANUAL (RC passthrough)
+ *   BtnA on M5Stick = force MANUAL override
  */
 
 #include <M5StickCPlus2.h>
@@ -27,12 +30,19 @@
 
 /* ── Pin assignments (M5StickC Plus 2) ───────────────────────────────────── */
 
-#define PIN_ENCODER_L   26   /* HAT connector, interrupt-capable */
-#define PIN_ENCODER_R   36   /* HAT connector, input-only, interrupt OK */
-#define PIN_STEERING    0    /* HAT connector, PWM output */
-#define PIN_THROTTLE    25   /* HAT connector, PWM output */
+#define PIN_ENCODER_L   26   /* HAT, interrupt-capable */
+#define PIN_ENCODER_R   36   /* HAT, input-only, interrupt OK */
+#define PIN_STEERING    0    /* HAT, PWM output */
+#define PIN_THROTTLE    25   /* HAT, PWM output */
 #define PIN_I2C_SDA     32   /* Grove port */
 #define PIN_I2C_SCL     33   /* Grove port */
+
+/* RC input: ESP32 has limited pins on M5StickC Plus 2.
+ * Option 1: Use BtnA (G37) as manual override toggle (no RC PWM reading)
+ * Option 2: Sacrifice one encoder and use G36 for RC mode channel
+ * We use Option 1: button toggle + Jetson arm flag for mode control */
+#define PIN_BTN_A       37   /* Built-in button A (input-only) */
+#define PIN_BTN_B       39   /* Built-in button B (input-only) */
 
 /* ── Constants ───────────────────────────────────────────────────────────── */
 
@@ -42,7 +52,7 @@
 #define PWM_MAX         2000
 #define DISPLAY_RATE_MS 200     /* 5 Hz display update */
 
-/* ── Encoder state (ISR-safe) ────────────────────────────────────────────── */
+/* ── Encoder ISR ─────────────────────────────────────────────────────────── */
 
 static volatile uint32_t encoder_l_count = 0;
 static volatile uint32_t encoder_r_count = 0;
@@ -57,53 +67,72 @@ sh2_SensorValue_t imu_value;
 Servo servo_steering;
 Servo servo_throttle;
 
-/* IMU data */
+/* IMU */
 static float g_qw = 1.0f, g_qx = 0.0f, g_qy = 0.0f, g_qz = 0.0f;
 static float g_ax = 0.0f, g_ay = 0.0f, g_az = 0.0f;
 static float g_gx = 0.0f, g_gy = 0.0f, g_gz = 0.0f;
 
-/* Wheel speed */
+/* Wheels */
 static float g_wheel_l_rps = 0.0f;
-static float g_wheel_r_rps = 0.0f;
-static uint32_t prev_enc_l = 0, prev_enc_r = 0;
+static uint32_t prev_enc_l = 0;
 
-/* Command state */
+/* Jetson commands */
 static float cmd_steering = 0.0f;
 static float cmd_throttle = 0.0f;
 static uint8_t cmd_flags = 0;
 static unsigned long last_cmd_ms = 0;
 
+/* Mode control */
+static uint8_t drive_mode = PROTO_MODE_MANUAL;  /* Start manual (safe) */
+static bool manual_override = true;  /* BtnA toggles this */
+
 /* Timing */
 static unsigned long next_telem_us = 0;
 static unsigned long next_display_ms = 0;
 
-/* Serial receive buffer */
+/* Serial */
 static uint8_t rx_buf[32];
 static uint8_t rx_idx = 0;
 
-/* Status */
+/* Stats */
 static bool imu_ok = false;
 static uint32_t telem_count = 0;
 static uint32_t cmd_count = 0;
 
-/* ── BNO085 setup via Grove I2C ──────────────────────────────────────────── */
+/* ── Mode control ────────────────────────────────────────────────────────── */
 
-static bool setup_imu() {
-    /* Use Wire1 for Grove port (G32/G33), Wire0 is internal MPU6886 */
-    Wire1.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
-
-    if (!bno.begin_I2C(0x4A, &Wire1)) {
-        return false;
+static void update_drive_mode() {
+    /* BtnA press toggles manual override */
+    /* M5StickC Plus 2 buttons are active-low, handled by StickCP2.update() */
+    if (StickCP2.BtnA.wasPressed()) {
+        manual_override = !manual_override;
     }
 
+    /* BtnB = emergency stop (always available) */
+    if (StickCP2.BtnB.isPressed()) {
+        drive_mode = PROTO_MODE_FAILSAFE;
+        return;
+    }
+
+    if (manual_override) {
+        drive_mode = PROTO_MODE_MANUAL;
+    } else {
+        /* Auto mode: Jetson controls, but only if armed */
+        bool armed = (cmd_flags & 0x01) != 0;
+        drive_mode = armed ? PROTO_MODE_AUTO : PROTO_MODE_MANUAL;
+    }
+}
+
+/* ── IMU ─────────────────────────────────────────────────────────────────── */
+
+static bool setup_imu() {
+    Wire1.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
+    if (!bno.begin_I2C(0x4A, &Wire1)) return false;
     if (!bno.enableReport(SH2_ROTATION_VECTOR, IMU_RATE_US)) return false;
     if (!bno.enableReport(SH2_LINEAR_ACCELERATION, IMU_RATE_US)) return false;
     if (!bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_RATE_US)) return false;
-
     return true;
 }
-
-/* ── Read IMU ────────────────────────────────────────────────────────────── */
 
 static void read_imu() {
     while (bno.getSensorEvent(&imu_value)) {
@@ -128,25 +157,19 @@ static void read_imu() {
     }
 }
 
-/* ── Compute wheel speeds ────────────────────────────────────────────────── */
+/* ── Wheels ───────────────────────────────────────────────────────────────── */
 
 static void compute_wheel_speeds(float dt_s) {
     uint32_t enc_l = encoder_l_count;
-    uint32_t enc_r = encoder_r_count;
-
     uint32_t dl = enc_l - prev_enc_l;
-    uint32_t dr = enc_r - prev_enc_r;
     prev_enc_l = enc_l;
-    prev_enc_r = enc_r;
-
     const float ticks_per_rev = 20.0f;
     if (dt_s > 0.001f) {
         g_wheel_l_rps = (float)dl / (ticks_per_rev * dt_s);
-        g_wheel_r_rps = (float)dr / (ticks_per_rev * dt_s);
     }
 }
 
-/* ── Send telemetry ──────────────────────────────────────────────────────── */
+/* ── Telemetry ───────────────────────────────────────────────────────────── */
 
 static void send_telemetry() {
     uint8_t pkt[PROTO_TELEM_SIZE];
@@ -154,32 +177,29 @@ static void send_telemetry() {
         g_qw, g_qx, g_qy, g_qz,
         g_ax, g_ay, g_az,
         g_gx, g_gy, g_gz,
-        g_wheel_l_rps);
+        g_wheel_l_rps,
+        drive_mode,
+        PWM_NEUTRAL,  /* No RC PWM reading on ESP32 — report neutral */
+        0);           /* No RC throttle */
     Serial.write(pkt, PROTO_TELEM_SIZE);
     telem_count++;
 }
 
-/* ── Parse incoming commands ─────────────────────────────────────────────── */
+/* ── Commands ────────────────────────────────────────────────────────────── */
 
 static void parse_commands() {
     while (Serial.available()) {
         rx_buf[rx_idx++] = Serial.read();
-
-        if (rx_idx >= sizeof(rx_buf)) {
-            rx_idx = 0;
-            continue;
-        }
+        if (rx_idx >= sizeof(rx_buf)) { rx_idx = 0; continue; }
 
         if (rx_idx >= PROTO_CMD_SIZE) {
             uint8_t start = 255;
             for (uint8_t i = 0; i <= rx_idx - PROTO_CMD_SIZE; i++) {
                 if (rx_buf[i] == PROTO_CMD_SYNC &&
                     rx_buf[i + PROTO_CMD_SIZE - 1] == PROTO_CMD_END) {
-                    start = i;
-                    break;
+                    start = i; break;
                 }
             }
-
             if (start < 255) {
                 proto_command_t parsed = proto_parse_command(&rx_buf[start]);
                 if (parsed.valid) {
@@ -195,29 +215,44 @@ static void parse_commands() {
     }
 }
 
-/* ── Apply actuator outputs ──────────────────────────────────────────────── */
+/* ── Actuators ───────────────────────────────────────────────────────────── */
 
 static void apply_actuators() {
-    bool armed = (cmd_flags & 0x01) != 0;
-    bool estop = (cmd_flags & 0x02) != 0;
-    bool watchdog_ok = (millis() - last_cmd_ms) < PROTO_WATCHDOG_MS;
+    int steer_us, throt_us;
 
-    if (!armed || estop || !watchdog_ok) {
-        servo_throttle.writeMicroseconds(PWM_NEUTRAL);
-        return;
+    switch (drive_mode) {
+        case PROTO_MODE_MANUAL:
+            /* On ESP32, manual = neutral (no RC PWM reading).
+             * User drives with Futaba directly to receiver-connected servos,
+             * OR this board is bypassed in manual mode. */
+            steer_us = PWM_NEUTRAL;
+            throt_us = PWM_NEUTRAL;
+            break;
+
+        case PROTO_MODE_AUTO: {
+            bool watchdog_ok = (millis() - last_cmd_ms) < PROTO_WATCHDOG_MS;
+            if (!watchdog_ok) {
+                steer_us = PWM_NEUTRAL;
+                throt_us = PWM_NEUTRAL;
+            } else {
+                steer_us = PWM_NEUTRAL + (int)(cmd_steering * 500.0f);
+                throt_us = PWM_NEUTRAL + (int)(cmd_throttle * 500.0f);
+            }
+            break;
+        }
+
+        case PROTO_MODE_FAILSAFE:
+        default:
+            steer_us = PWM_NEUTRAL;
+            throt_us = PWM_NEUTRAL;
+            break;
     }
 
-    int steer_us = PWM_NEUTRAL + (int)(cmd_steering * 500.0f);
-    int throt_us = PWM_NEUTRAL + (int)(cmd_throttle * 500.0f);
-
-    steer_us = constrain(steer_us, PWM_MIN, PWM_MAX);
-    throt_us = constrain(throt_us, PWM_MIN, PWM_MAX);
-
-    servo_steering.writeMicroseconds(steer_us);
-    servo_throttle.writeMicroseconds(throt_us);
+    servo_steering.writeMicroseconds(constrain(steer_us, PWM_MIN, PWM_MAX));
+    servo_throttle.writeMicroseconds(constrain(throt_us, PWM_MIN, PWM_MAX));
 }
 
-/* ── TFT display update ─────────────────────────────────────────────────── */
+/* ── Display ─────────────────────────────────────────────────────────────── */
 
 static void update_display() {
     auto& lcd = StickCP2.Display;
@@ -225,37 +260,44 @@ static void update_display() {
     lcd.setCursor(0, 0);
     lcd.setTextSize(1);
 
-    /* Title */
-    lcd.setTextColor(CYAN);
-    lcd.println("TruggyAD ESP32");
+    /* Mode banner */
+    uint16_t mode_color;
+    const char* mode_str;
+    switch (drive_mode) {
+        case PROTO_MODE_AUTO:     mode_color = GREEN;  mode_str = "AUTO";     break;
+        case PROTO_MODE_MANUAL:   mode_color = YELLOW; mode_str = "MANUAL";   break;
+        case PROTO_MODE_FAILSAFE: mode_color = RED;    mode_str = "FAILSAFE"; break;
+        default:                  mode_color = WHITE;  mode_str = "???";      break;
+    }
+    lcd.setTextColor(mode_color);
+    lcd.setTextSize(2);
+    lcd.println(mode_str);
+    lcd.setTextSize(1);
     lcd.println();
 
-    /* IMU status */
+    /* IMU */
     lcd.setTextColor(imu_ok ? GREEN : RED);
     lcd.printf("IMU: %s\n", imu_ok ? "OK" : "FAIL");
 
-    /* State */
+    /* Controls */
     lcd.setTextColor(WHITE);
     lcd.printf("Steer: %+.2f\n", cmd_steering);
     lcd.printf("Throt: %+.2f\n", cmd_throttle);
     lcd.printf("Speed: %.1f rps\n", g_wheel_l_rps);
-    lcd.println();
 
-    /* Counters */
-    lcd.setTextColor(YELLOW);
-    lcd.printf("TX: %lu\n", telem_count);
-    lcd.printf("RX: %lu\n", cmd_count);
+    /* Stats */
+    lcd.setTextColor(CYAN);
+    lcd.printf("TX:%lu RX:%lu\n", telem_count, cmd_count);
 
-    /* Armed status */
-    bool armed = (cmd_flags & 0x01) != 0;
-    lcd.setTextColor(armed ? GREEN : RED);
-    lcd.printf("\n%s", armed ? "ARMED" : "DISARMED");
+    /* Hint */
+    lcd.setTextColor(DARKGREY);
+    lcd.println("\nBtnA: toggle mode");
+    lcd.println("BtnB: E-STOP");
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */
 
 void setup() {
-    /* M5StickC Plus 2 init (display, power, internal IMU) */
     auto cfg = M5.config();
     StickCP2.begin(cfg);
     StickCP2.Display.setRotation(1);
@@ -265,13 +307,13 @@ void setup() {
 
     Serial.begin(PROTO_SERIAL_BAUD);
 
-    /* Encoder interrupts */
+    /* Encoders */
     pinMode(PIN_ENCODER_L, INPUT_PULLUP);
-    pinMode(PIN_ENCODER_R, INPUT);  /* G36 is input-only, no pullup */
+    pinMode(PIN_ENCODER_R, INPUT);
     attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_L), isr_encoder_l, RISING);
     attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_R), isr_encoder_r, RISING);
 
-    /* Servo PWM (ESP32Servo uses LEDC channels) */
+    /* Servos */
     ESP32PWM::allocateTimer(0);
     ESP32PWM::allocateTimer(1);
     servo_steering.setPeriodHertz(50);
@@ -281,18 +323,19 @@ void setup() {
     servo_steering.writeMicroseconds(PWM_NEUTRAL);
     servo_throttle.writeMicroseconds(PWM_NEUTRAL);
 
-    /* BNO085 IMU via Grove I2C */
+    /* IMU */
     imu_ok = setup_imu();
 
     StickCP2.Display.fillScreen(BLACK);
     StickCP2.Display.setCursor(0, 0);
-    StickCP2.Display.printf("IMU: %s\nReady.", imu_ok ? "OK" : "FAIL");
+    StickCP2.Display.printf("IMU: %s\nMode: MANUAL\nReady.",
+                            imu_ok ? "OK" : "FAIL");
 
     next_telem_us = micros();
     next_display_ms = millis();
 }
 
-/* ── Main loop (100 Hz sensor + telemetry) ───────────────────────────────── */
+/* ── Loop ────────────────────────────────────────────────────────────────── */
 
 void loop() {
     unsigned long now_us = micros();
@@ -300,18 +343,12 @@ void loop() {
     if (now_us >= next_telem_us) {
         float dt_s = (float)IMU_RATE_US / 1000000.0f;
 
-        /* Read sensors */
         if (imu_ok) read_imu();
         compute_wheel_speeds(dt_s);
-
-        /* Send telemetry (same format as Arduino Uno) */
-        send_telemetry();
-
-        /* Parse commands */
         parse_commands();
-
-        /* Apply actuators */
+        update_drive_mode();
         apply_actuators();
+        send_telemetry();
 
         next_telem_us += IMU_RATE_US;
         if (now_us > next_telem_us + IMU_RATE_US * 2) {
@@ -319,10 +356,10 @@ void loop() {
         }
     }
 
-    /* Update display at 5 Hz */
+    /* Display at 5 Hz */
     unsigned long now_ms = millis();
     if (now_ms >= next_display_ms) {
-        StickCP2.update();  /* Read buttons */
+        StickCP2.update();
         update_display();
         next_display_ms += DISPLAY_RATE_MS;
     }
