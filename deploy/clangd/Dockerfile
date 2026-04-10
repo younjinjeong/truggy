@@ -16,19 +16,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install CUDA headers only (no runtime — this is for LSP indexing, not execution)
-# Using CUDA 10.2 to match JetPack 4.6 on Nano 2GB
-RUN wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.0-1_all.deb \
-    && dpkg -i cuda-keyring_1.0-1_all.deb \
-    && rm cuda-keyring_1.0-1_all.deb \
+# Using CUDA 12.2 for header compatibility (clangd only needs headers, not matching target)
+RUN wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb \
+    && dpkg -i cuda-keyring_1.1-1_all.deb \
+    && rm cuda-keyring_1.1-1_all.deb \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-       cuda-cudart-dev-10-2 \
-       cuda-nvcc-10-2 \
-       cuda-curand-dev-10-2 \
+       cuda-cudart-dev-12-2 \
+       cuda-nvcc-12-2 \
+       cuda-curand-dev-12-2 \
     && rm -rf /var/lib/apt/lists/*
 
-ENV PATH="/usr/local/cuda-10.2/bin:${PATH}"
-ENV CUDA_HOME="/usr/local/cuda-10.2"
+ENV PATH="/usr/local/cuda-12.2/bin:${PATH}"
+ENV CUDA_HOME="/usr/local/cuda-12.2"
 
 # Create workspace mount point
 RUN mkdir -p /workspace
