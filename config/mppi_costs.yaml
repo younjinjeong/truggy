@@ -1,0 +1,16 @@
+# MPPI Cost Function Parameters
+# Reference: AutoRally path_integral_nn.launch lines 47-58
+
+costs:
+  desired_speed: 4.0          # m/s (conservative, increase gradually)
+  speed_coeff: 4.25           # penalty weight for speed deviation
+  track_coeff: 200.0          # penalty for leaving track
+  max_slip_angle: 1.25        # radians — trigger slip penalty above this
+  slip_penalty: 10.0          # stabilizing cost weight
+  track_slop: 0.0             # costmap boundary softness
+  crash_coeff: 10000.0        # penalty for |roll| > PI/2
+  steering_coeff: 0.0         # control regularization (0 = off initially)
+  throttle_coeff: 0.0         # control regularization (0 = off initially)
+  boundary_threshold: 0.65    # costmap value threshold for "off track"
+  discount: 0.9               # crash cost decay over horizon
+  l1_cost: false              # use L1 instead of L2 for speed cost

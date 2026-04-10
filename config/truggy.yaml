@@ -1,0 +1,63 @@
+# TruggyAD Configuration
+# Vehicle and system parameters for 1/8 scale RC Truggy
+
+vehicle:
+  wheelbase: 0.35            # meters (1/8 truggy, AutoRally is 0.57)
+  track_width: 0.30          # meters
+  wheel_radius: 0.06         # meters (tire radius)
+  mass: 5.0                  # kg (with electronics)
+
+camera:
+  resolution: 720             # HD720
+  fps: 30
+  depth_mode: "PERFORMANCE"   # PERFORMANCE (Nano) or NEURAL (Orin)
+  mount_height: 0.25          # meters above ground
+  mount_pitch: -12.0          # degrees (negative = downward)
+
+imu:
+  i2c_address: 0x4A           # BNO085
+  update_rate: 100            # Hz
+
+serial:
+  port: "/dev/ttyACM0"
+  baud: 115200
+  command_rate: 50            # Hz
+  telemetry_rate: 100         # Hz
+  watchdog_ms: 250            # ms before throttle neutral
+
+mppi:
+  hz: 50
+  num_timesteps: 100
+  gamma: 0.15                 # softmax temperature
+  num_iters: 1                # optimization iterations per cycle
+  optimization_stride: 1
+  init_steering: 0.0
+  init_throttle: 0.0
+  steering_std: 0.275         # exploration noise stddev
+  throttle_std: 0.3
+  max_throttle: 0.65
+  min_throttle: -0.99
+  max_steering: 0.99
+  min_steering: -0.99
+  model_path: "models/dynamics_model.npz"
+
+costmap:
+  width: 200                  # cells
+  height: 120                 # cells
+  cell_size: 0.05             # meters per cell (5cm)
+  x_min: -5.0                 # meters (ego-centric)
+  x_max: 5.0
+  y_min: 0.0
+  y_max: 6.0
+
+ekf:
+  # Process noise (diagonal Q matrix)
+  q_pos: 0.01                # position noise
+  q_yaw: 0.001               # yaw noise
+  q_vel: 0.1                 # velocity noise
+  q_yaw_rate: 0.01           # yaw rate noise
+  # VIO measurement noise
+  r_vio_pos: 0.05            # position measurement noise
+  r_vio_yaw: 0.02            # yaw measurement noise
+  # Wheel encoder measurement noise
+  r_wheel: 0.1               # speed measurement noise
