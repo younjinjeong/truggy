@@ -4,6 +4,7 @@
 #include "actuation/bridge.h"
 #include "planning/mppi.h"
 #include "state/ekf.h"
+#include "common/logger.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -88,15 +89,17 @@ static void set_thread_priority(pthread_t thread, int priority) {
 // ── Main ────────────────────────────────────────────────────────────────────
 
 static void print_usage(const char* prog) {
-    fprintf(stderr, "Usage: %s [--config <path>] [--costs <path>] [--sim]\n", prog);
+    fprintf(stderr, "Usage: %s [--config <path>] [--costs <path>] [--sim] [--log <path>]\n", prog);
     fprintf(stderr, "  --config  Path to truggy.yaml (default: config/truggy.yaml)\n");
     fprintf(stderr, "  --costs   Path to mppi_costs.yaml (default: config/mppi_costs.yaml)\n");
     fprintf(stderr, "  --sim     Simulation mode (skip hardware init)\n");
+    fprintf(stderr, "  --log     Telemetry log file (binary, read with tools/viewer.py)\n");
 }
 
 int main(int argc, char** argv) {
     const char* config_path = "config/truggy.yaml";
     const char* costs_path  = "config/mppi_costs.yaml";
+    const char* log_path    = nullptr;
     bool sim_mode = false;
 
     for (int i = 1; i < argc; i++) {
@@ -104,6 +107,8 @@ int main(int argc, char** argv) {
             config_path = argv[++i];
         } else if (strcmp(argv[i], "--costs") == 0 && i + 1 < argc) {
             costs_path = argv[++i];
+        } else if (strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
+            log_path = argv[++i];
         } else if (strcmp(argv[i], "--sim") == 0) {
             sim_mode = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
@@ -187,7 +192,27 @@ int main(int argc, char** argv) {
 
     fprintf(stderr, "[main] All threads running. Press Ctrl+C to stop.\n");
 
-    // ── Wait for shutdown ───────────────────────────────────────────────
+    // ── Telemetry logging (main thread) ─────────────────────────────────
+    logger_t logger = {};
+    if (log_path) {
+        logger_open(logger, log_path, 50);  // 50 Hz logging
+    }
+
+    // Main thread: monitor and log until shutdown
+    while (bus->alive.load(std::memory_order_relaxed)) {
+        if (log_path) {
+            state_7d_t state = seqlock_read(bus->state_lock, bus->state);
+            control_2d_t ctrl = seqlock_read(bus->control_lock, bus->control);
+            logger_write(logger, now_us(), state, ctrl);
+        }
+        sleep_until_us(now_us() + 10000);  // 100 Hz monitor loop
+    }
+
+    if (log_path) {
+        logger_close(logger);
+    }
+
+    // ── Wait for threads ────────────────────────────────────────────────
     pthread_join(t1, nullptr);
     pthread_join(t0, nullptr);
     pthread_join(t2, nullptr);
