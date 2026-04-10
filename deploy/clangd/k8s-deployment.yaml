@@ -1,0 +1,63 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: truggy-dev
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: clangd-lsp
+  namespace: truggy-dev
+  labels:
+    app: clangd-lsp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: clangd-lsp
+  template:
+    metadata:
+      labels:
+        app: clangd-lsp
+    spec:
+      containers:
+      - name: clangd
+        image: truggy/clangd:latest
+        # Override entrypoint to keep container running
+        # clangd is invoked per-session via kubectl exec
+        command: ["sleep", "infinity"]
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "2"
+        volumeMounts:
+        - name: workspace
+          mountPath: /workspace
+        - name: clangd-cache
+          mountPath: /root/.cache/clangd
+      volumes:
+      # Mount the truggy source code — adjust hostPath to match your setup
+      - name: workspace
+        hostPath:
+          path: /home/younjinjeong/Workspace/TruggyAD/truggy
+          type: Directory
+      - name: clangd-cache
+        emptyDir:
+          sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: clangd-lsp
+  namespace: truggy-dev
+spec:
+  selector:
+    app: clangd-lsp
+  ports:
+  - port: 50051
+    targetPort: 50051
+    name: lsp
+  type: ClusterIP
