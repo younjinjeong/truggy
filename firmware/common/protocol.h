@@ -1,9 +1,11 @@
 /*
- * TruggyAD Serial Protocol — Shared between Arduino Uno and ESP32
+ * TruggyAD Serial Protocol v2 — Shared between Arduino Uno and ESP32
  *
  * Binary protocol between MCU and Jetson Nano over USB serial (115200 baud).
  * Both firmware versions produce identical packets so the Jetson-side
  * bridge (src/actuation/bridge.cpp) works unchanged.
+ *
+ * v2 changes: extended telemetry to 28 bytes with RC mode + RC steering
  */
 
 #ifndef TRUGGY_PROTOCOL_H
@@ -18,10 +20,20 @@
 #define PROTO_CMD_SIZE   8
 
 #define PROTO_TELEM_SYNC 0xBB
-#define PROTO_TELEM_SIZE 24
+#define PROTO_TELEM_SIZE 28       /* v2: was 24, now 28 with RC data */
 
 #define PROTO_SERIAL_BAUD 115200
 #define PROTO_WATCHDOG_MS 250
+
+/* ── Drive mode ──────────────────────────────────────────────────────────── */
+
+#define PROTO_MODE_MANUAL    0x00  /* RC passthrough, Jetson commands ignored */
+#define PROTO_MODE_AUTO      0x01  /* Jetson commands control servos */
+#define PROTO_MODE_FAILSAFE  0x02  /* No RC signal, neutral output */
+
+/* RC mode switch threshold: > 1700us = auto, < 1300us = manual */
+#define PROTO_RC_AUTO_THRESHOLD   1700
+#define PROTO_RC_MANUAL_THRESHOLD 1300
 
 /* ── CRC-8 (Dallas/Maxim, polynomial 0x31) ───────────────────────────────── */
 
@@ -51,14 +63,36 @@ static inline int16_t proto_unpack16(const uint8_t* buf, int idx) {
     return (int16_t)((buf[idx] << 8) | buf[idx + 1]);
 }
 
-/* ── Telemetry packet builder ────────────────────────────────────────────── */
+/* ── Telemetry packet builder (v2: 28 bytes) ─────────────────────────────── */
+/*
+ * Byte layout:
+ *   0:     sync (0xBB)
+ *   1-2:   qw (int16, *10000)
+ *   3-4:   qx
+ *   5-6:   qy
+ *   7-8:   qz
+ *   9-10:  ax (int16, *1000, m/s^2)
+ *  11-12:  ay
+ *  13-14:  az
+ *  15-16:  gx (int16, *1000, rad/s)
+ *  17-18:  gy
+ *  19-20:  gz
+ *  21-22:  wheel_L (int16, *100, rev/s)
+ *  23:     drive_mode (MANUAL/AUTO/FAILSAFE)
+ *  24-25:  rc_steering (int16, raw PWM us, 1000-2000)
+ *  26:     rc_throttle_pct (int8, -100 to +100, percent of range)
+ *  27:     CRC-8 over bytes 1-26
+ */
 
 static inline void proto_build_telemetry(
     uint8_t* pkt,
     float qw, float qx, float qy, float qz,
     float ax, float ay, float az,
     float gx, float gy, float gz,
-    float wheel_l_rps)
+    float wheel_l_rps,
+    uint8_t drive_mode,
+    uint16_t rc_steering_us,
+    int8_t rc_throttle_pct)
 {
     pkt[0] = PROTO_TELEM_SYNC;
     proto_pack16(pkt, 1,  qw, 10000.0f);
@@ -72,7 +106,11 @@ static inline void proto_build_telemetry(
     proto_pack16(pkt, 17, gy, 1000.0f);
     proto_pack16(pkt, 19, gz, 1000.0f);
     proto_pack16(pkt, 21, wheel_l_rps, 100.0f);
-    pkt[23] = proto_crc8(pkt + 1, 22);
+    pkt[23] = drive_mode;
+    pkt[24] = (uint8_t)(rc_steering_us >> 8);
+    pkt[25] = (uint8_t)(rc_steering_us & 0xFF);
+    pkt[26] = (uint8_t)rc_throttle_pct;
+    pkt[27] = proto_crc8(pkt + 1, 26);
 }
 
 /* ── Command packet parser ───────────────────────────────────────────────── */

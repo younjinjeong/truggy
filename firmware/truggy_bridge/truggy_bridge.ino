@@ -1,5 +1,5 @@
 /*
- * TruggyAD Arduino Bridge Firmware
+ * TruggyAD Arduino Uno Bridge Firmware
  *
  * Hardware:
  *   - BNO085 IMU via I2C (A4/A5, address 0x4A)
@@ -9,10 +9,14 @@
  *   - ESC/throttle on D10
  *   - Run-stop relay on D7
  *   - USB Serial to Jetson at 115200 baud
+ *   - Futaba receiver CH1 (steering) on D4
+ *   - Futaba receiver CH2 (throttle) on D5
+ *   - Futaba receiver CH3 (mode switch) on D6
  *
- * Protocol:
- *   TX (100 Hz): 24-byte telemetry packet (sync 0xBB)
- *   RX (50 Hz):   8-byte command packet (sync 0xAA, end 0x55)
+ * Mode control via Futaba 7PX:
+ *   CH3 switch > 1700us = AUTO (Jetson controls)
+ *   CH3 switch < 1300us = MANUAL (RC passthrough)
+ *   No signal = FAILSAFE (neutral output)
  */
 
 #include <Wire.h>
@@ -22,11 +26,14 @@
 
 /* ── Pin assignments (Arduino Uno) ───────────────────────────────────────── */
 
-#define PIN_ENCODER_L   2   /* INT0 */
-#define PIN_ENCODER_R   3   /* INT1 */
-#define PIN_RUNSTOP     7
-#define PIN_STEERING    9
-#define PIN_THROTTLE    10
+#define PIN_ENCODER_L   2   /* INT0 — wheel encoder left */
+#define PIN_ENCODER_R   3   /* INT1 — wheel encoder right */
+#define PIN_RC_STEER    4   /* Futaba receiver CH1 (steering) */
+#define PIN_RC_THROT    5   /* Futaba receiver CH2 (throttle) */
+#define PIN_RC_MODE     6   /* Futaba receiver CH3 (auto/manual switch) */
+#define PIN_RUNSTOP     7   /* Run-stop relay */
+#define PIN_STEERING    9   /* Steering servo output */
+#define PIN_THROTTLE    10  /* ESC output */
 
 /* ── Constants ───────────────────────────────────────────────────────────── */
 
@@ -34,6 +41,9 @@
 #define PWM_NEUTRAL     1500
 #define PWM_MIN         1000
 #define PWM_MAX         2000
+#define RC_TIMEOUT_MS   500     /* No RC pulse = failsafe */
+#define RC_PULSE_MIN    900     /* Valid PWM range */
+#define RC_PULSE_MAX    2100
 
 /* ── Encoder state (ISR) ─────────────────────────────────────────────────── */
 
@@ -50,21 +60,27 @@ sh2_SensorValue_t imu_value;
 Servo servo_steering;
 Servo servo_throttle;
 
-/* IMU data (updated at 100 Hz) */
+/* IMU data */
 static float g_qw = 1.0f, g_qx = 0.0f, g_qy = 0.0f, g_qz = 0.0f;
 static float g_ax = 0.0f, g_ay = 0.0f, g_az = 0.0f;
 static float g_gx = 0.0f, g_gy = 0.0f, g_gz = 0.0f;
 
-/* Wheel speed (computed from encoder counts) */
+/* Wheel speed */
 static float g_wheel_l_rps = 0.0f;
-static float g_wheel_r_rps = 0.0f;
 static uint32_t prev_enc_l = 0, prev_enc_r = 0;
 
-/* Command state */
+/* Jetson command state */
 static float cmd_steering = 0.0f;
 static float cmd_throttle = 0.0f;
 static uint8_t cmd_flags = 0;
 static unsigned long last_cmd_ms = 0;
+
+/* RC receiver state */
+static uint16_t rc_steer_us = PWM_NEUTRAL;
+static uint16_t rc_throt_us = PWM_NEUTRAL;
+static uint16_t rc_mode_us  = PWM_NEUTRAL;
+static unsigned long last_rc_ms = 0;
+static uint8_t drive_mode = PROTO_MODE_FAILSAFE;
 
 /* Timing */
 static unsigned long next_telem_us = 0;
@@ -73,32 +89,51 @@ static unsigned long next_telem_us = 0;
 static uint8_t rx_buf[16];
 static uint8_t rx_idx = 0;
 
-/* CRC-8 uses shared implementation from protocol.h: proto_crc8() */
+/* ── RC PWM reading ──────────────────────────────────────────────────────── */
+/* Uses pulseIn() which is blocking but acceptable at 100Hz loop rate
+   since RC PWM period is 20ms and we read 3 channels sequentially.
+   Each pulseIn takes ~1-2ms. Total ~5ms per cycle, fits in 10ms budget. */
+
+static bool read_rc_channel(uint8_t pin, uint16_t* out_us) {
+    unsigned long pw = pulseIn(pin, HIGH, 25000);  /* 25ms timeout */
+    if (pw >= RC_PULSE_MIN && pw <= RC_PULSE_MAX) {
+        *out_us = (uint16_t)pw;
+        return true;
+    }
+    return false;
+}
+
+static void read_rc_inputs() {
+    bool got_signal = false;
+
+    if (read_rc_channel(PIN_RC_STEER, &rc_steer_us)) got_signal = true;
+    if (read_rc_channel(PIN_RC_THROT, &rc_throt_us)) got_signal = true;
+    if (read_rc_channel(PIN_RC_MODE,  &rc_mode_us))  got_signal = true;
+
+    if (got_signal) {
+        last_rc_ms = millis();
+    }
+
+    /* Determine drive mode from CH3 switch */
+    bool rc_connected = (millis() - last_rc_ms) < RC_TIMEOUT_MS;
+    if (!rc_connected) {
+        drive_mode = PROTO_MODE_FAILSAFE;
+    } else if (rc_mode_us > PROTO_RC_AUTO_THRESHOLD) {
+        drive_mode = PROTO_MODE_AUTO;
+    } else {
+        drive_mode = PROTO_MODE_MANUAL;
+    }
+}
 
 /* ── IMU setup ───────────────────────────────────────────────────────────── */
 
 static bool setup_imu() {
-    if (!bno.begin_I2C(0x4A)) {
-        return false;
-    }
-
-    /* Enable rotation vector (quaternion) at 100 Hz */
-    if (!bno.enableReport(SH2_ROTATION_VECTOR, IMU_RATE_US)) {
-        return false;
-    }
-    /* Enable linear acceleration at 100 Hz */
-    if (!bno.enableReport(SH2_LINEAR_ACCELERATION, IMU_RATE_US)) {
-        return false;
-    }
-    /* Enable gyroscope at 100 Hz */
-    if (!bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_RATE_US)) {
-        return false;
-    }
-
+    if (!bno.begin_I2C(0x4A)) return false;
+    if (!bno.enableReport(SH2_ROTATION_VECTOR, IMU_RATE_US)) return false;
+    if (!bno.enableReport(SH2_LINEAR_ACCELERATION, IMU_RATE_US)) return false;
+    if (!bno.enableReport(SH2_GYROSCOPE_CALIBRATED, IMU_RATE_US)) return false;
     return true;
 }
-
-/* ── Read IMU ────────────────────────────────────────────────────────────── */
 
 static void read_imu() {
     while (bno.getSensorEvent(&imu_value)) {
@@ -123,45 +158,45 @@ static void read_imu() {
     }
 }
 
-/* ── Compute wheel speeds ────────────────────────────────────────────────── */
+/* ── Wheel speed ─────────────────────────────────────────────────────────── */
 
 static void compute_wheel_speeds(float dt_s) {
     noInterrupts();
     uint32_t enc_l = encoder_l_count;
-    uint32_t enc_r = encoder_r_count;
     interrupts();
 
     uint32_t dl = enc_l - prev_enc_l;
-    uint32_t dr = enc_r - prev_enc_r;
     prev_enc_l = enc_l;
-    prev_enc_r = enc_r;
 
-    /* Ticks per revolution — measure and update this constant */
     const float ticks_per_rev = 20.0f;
     if (dt_s > 0.001f) {
         g_wheel_l_rps = (float)dl / (ticks_per_rev * dt_s);
-        g_wheel_r_rps = (float)dr / (ticks_per_rev * dt_s);
     }
 }
 
-/* ── Encode and send telemetry ───────────────────────────────────────────── */
+/* ── Telemetry ───────────────────────────────────────────────────────────── */
 
 static void send_telemetry() {
+    int8_t rc_throt_pct = (int8_t)constrain(
+        ((int)rc_throt_us - PWM_NEUTRAL) * 100 / 500, -100, 100);
+
     uint8_t pkt[PROTO_TELEM_SIZE];
     proto_build_telemetry(pkt,
         g_qw, g_qx, g_qy, g_qz,
         g_ax, g_ay, g_az,
         g_gx, g_gy, g_gz,
-        g_wheel_l_rps);
+        g_wheel_l_rps,
+        drive_mode,
+        rc_steer_us,
+        rc_throt_pct);
     Serial.write(pkt, PROTO_TELEM_SIZE);
 }
 
-/* ── Parse incoming command ──────────────────────────────────────────────── */
+/* ── Command parsing ─────────────────────────────────────────────────────── */
 
 static void parse_commands() {
     while (Serial.available()) {
-        uint8_t b = Serial.read();
-        rx_buf[rx_idx++] = b;
+        rx_buf[rx_idx++] = Serial.read();
 
         if (rx_idx >= sizeof(rx_buf)) {
             rx_idx = 0;
@@ -169,7 +204,6 @@ static void parse_commands() {
         }
 
         if (rx_idx >= PROTO_CMD_SIZE) {
-            /* Scan for complete command packet */
             uint8_t start = 255;
             for (uint8_t i = 0; i <= rx_idx - PROTO_CMD_SIZE; i++) {
                 if (rx_buf[i] == PROTO_CMD_SYNC &&
@@ -193,30 +227,51 @@ static void parse_commands() {
     }
 }
 
-/* ── Apply actuator outputs ──────────────────────────────────────────────── */
+/* ── Actuator output ─────────────────────────────────────────────────────── */
 
 static void apply_actuators() {
-    bool armed = (cmd_flags & 0x01) != 0;
-    bool estop = (cmd_flags & 0x02) != 0;
-    bool watchdog_ok = (millis() - last_cmd_ms) < PROTO_WATCHDOG_MS;
+    int steer_us, throt_us;
 
-    if (!armed || estop || !watchdog_ok) {
-        /* Safety: neutral throttle, keep last steering */
-        servo_throttle.writeMicroseconds(PWM_NEUTRAL);
-        digitalWrite(PIN_RUNSTOP, HIGH);  /* STOP */
-        return;
+    switch (drive_mode) {
+        case PROTO_MODE_MANUAL:
+            /* RC passthrough: Futaba 7PX controls directly */
+            steer_us = rc_steer_us;
+            throt_us = rc_throt_us;
+            digitalWrite(PIN_RUNSTOP, LOW);  /* RUN */
+            break;
+
+        case PROTO_MODE_AUTO: {
+            /* Jetson controls: use serial commands */
+            bool armed = (cmd_flags & 0x01) != 0;
+            bool estop = (cmd_flags & 0x02) != 0;
+            bool watchdog_ok = (millis() - last_cmd_ms) < PROTO_WATCHDOG_MS;
+
+            if (!armed || estop || !watchdog_ok) {
+                steer_us = PWM_NEUTRAL;
+                throt_us = PWM_NEUTRAL;
+                digitalWrite(PIN_RUNSTOP, HIGH);  /* STOP */
+            } else {
+                steer_us = PWM_NEUTRAL + (int)(cmd_steering * 500.0f);
+                throt_us = PWM_NEUTRAL + (int)(cmd_throttle * 500.0f);
+                digitalWrite(PIN_RUNSTOP, LOW);  /* RUN */
+            }
+            break;
+        }
+
+        case PROTO_MODE_FAILSAFE:
+        default:
+            /* No RC signal: safe neutral */
+            steer_us = PWM_NEUTRAL;
+            throt_us = PWM_NEUTRAL;
+            digitalWrite(PIN_RUNSTOP, HIGH);  /* STOP */
+            break;
     }
-
-    /* Convert [-1, 1] to PWM [1000, 2000] */
-    int steer_us = PWM_NEUTRAL + (int)(cmd_steering * 500.0f);
-    int throt_us = PWM_NEUTRAL + (int)(cmd_throttle * 500.0f);
 
     steer_us = constrain(steer_us, PWM_MIN, PWM_MAX);
     throt_us = constrain(throt_us, PWM_MIN, PWM_MAX);
 
     servo_steering.writeMicroseconds(steer_us);
     servo_throttle.writeMicroseconds(throt_us);
-    digitalWrite(PIN_RUNSTOP, LOW);  /* RUN */
 }
 
 /* ── Setup ───────────────────────────────────────────────────────────────── */
@@ -224,13 +279,16 @@ static void apply_actuators() {
 void setup() {
     Serial.begin(PROTO_SERIAL_BAUD);
     Wire.begin();
-    Wire.setClock(400000);  /* 400 kHz I2C */
+    Wire.setClock(400000);
 
-    /* Pin modes */
+    /* Pins */
     pinMode(PIN_ENCODER_L, INPUT_PULLUP);
     pinMode(PIN_ENCODER_R, INPUT_PULLUP);
+    pinMode(PIN_RC_STEER, INPUT);
+    pinMode(PIN_RC_THROT, INPUT);
+    pinMode(PIN_RC_MODE, INPUT);
     pinMode(PIN_RUNSTOP, OUTPUT);
-    digitalWrite(PIN_RUNSTOP, HIGH);  /* Start in STOP mode */
+    digitalWrite(PIN_RUNSTOP, HIGH);  /* Start in STOP */
 
     /* Encoder interrupts */
     attachInterrupt(digitalPinToInterrupt(PIN_ENCODER_L), isr_encoder_l, RISING);
@@ -244,7 +302,6 @@ void setup() {
 
     /* IMU */
     if (!setup_imu()) {
-        /* Blink LED to indicate IMU failure */
         pinMode(LED_BUILTIN, OUTPUT);
         while (1) {
             digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
@@ -255,30 +312,22 @@ void setup() {
     next_telem_us = micros();
 }
 
-/* ── Main loop (100 Hz) ──────────────────────────────────────────────────── */
+/* ── Main loop ───────────────────────────────────────────────────────────── */
 
 void loop() {
     unsigned long now_us = micros();
 
     if (now_us >= next_telem_us) {
-        float dt_s = (float)IMU_RATE_US / 1000000.0f;  /* 0.01s */
+        float dt_s = (float)IMU_RATE_US / 1000000.0f;
 
-        /* Read sensors */
         read_imu();
+        read_rc_inputs();
         compute_wheel_speeds(dt_s);
-
-        /* Send telemetry */
         send_telemetry();
-
-        /* Parse any incoming commands */
         parse_commands();
-
-        /* Apply actuator outputs */
         apply_actuators();
 
         next_telem_us += IMU_RATE_US;
-
-        /* Prevent runaway if we fell behind */
         if (now_us > next_telem_us + IMU_RATE_US * 2) {
             next_telem_us = now_us + IMU_RATE_US;
         }
