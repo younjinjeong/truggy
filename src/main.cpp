@@ -3,6 +3,7 @@
 #include "common/timing.h"
 #include "actuation/bridge.h"
 #include "planning/mppi.h"
+#include "state/ekf.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -53,13 +54,8 @@ static void* planning_thread(void* arg) {
 }
 
 static void* state_estimation_thread(void* arg) {
-    auto* bus = (shared_bus_t*)arg;
-    fprintf(stderr, "[T2] State estimation thread started\n");
-    // TODO(epic5): call state_estimation_loop(bus, cfg)
-    while (bus->alive.load(std::memory_order_relaxed)) {
-        sleep_until_us(now_us() + 10000);  // ~100 Hz placeholder
-    }
-    fprintf(stderr, "[T2] State estimation thread stopped\n");
+    auto* ta = (thread_args_t*)arg;
+    state_estimation_loop(ta->bus, *ta->cfg);
     return nullptr;
 }
 
@@ -177,7 +173,7 @@ int main(int argc, char** argv) {
     }
 
     // T2: State Estimation
-    pthread_create(&t2, nullptr, state_estimation_thread, bus);
+    pthread_create(&t2, nullptr, state_estimation_thread, &ta);
     set_thread_affinity(t2, 1);
 
     // T0: Perception
