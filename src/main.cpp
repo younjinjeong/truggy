@@ -4,6 +4,7 @@
 #include "actuation/bridge.h"
 #include "planning/mppi.h"
 #include "state/ekf.h"
+#include "perception/perception.h"
 #include "common/logger.h"
 
 #include <cstdio>
@@ -32,21 +33,16 @@ static void signal_handler(int sig) {
 
 // ── Thread entry points ─────────────────────────────────────────────────────
 
-static void* perception_thread(void* arg) {
-    auto* bus = (shared_bus_t*)arg;
-    fprintf(stderr, "[T0] Perception thread started\n");
-    // TODO(epic3): call perception_loop(bus, cfg)
-    while (bus->alive.load(std::memory_order_relaxed)) {
-        sleep_until_us(now_us() + 33333);  // ~30 Hz placeholder
-    }
-    fprintf(stderr, "[T0] Perception thread stopped\n");
-    return nullptr;
-}
-
 struct thread_args_t {
     shared_bus_t* bus;
     config_t* cfg;
 };
+
+static void* perception_thread(void* arg) {
+    auto* ta = (thread_args_t*)arg;
+    perception_loop(ta->bus, *ta->cfg);
+    return nullptr;
+}
 
 static void* planning_thread(void* arg) {
     auto* ta = (thread_args_t*)arg;
@@ -182,7 +178,7 @@ int main(int argc, char** argv) {
     set_thread_affinity(t2, 1);
 
     // T0: Perception
-    pthread_create(&t0, nullptr, perception_thread, bus);
+    pthread_create(&t0, nullptr, perception_thread, &ta);
     set_thread_affinity(t0, 3);
 
     // T1: Planning (highest priority)
