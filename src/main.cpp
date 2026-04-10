@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <csignal>
 #include <cstring>
+#include <unistd.h>
 #include <pthread.h>
 #include <sched.h>
 
@@ -19,8 +20,10 @@ static shared_bus_t* g_bus = nullptr;
 static void signal_handler(int sig) {
     (void)sig;
     if (g_bus) {
-        fprintf(stderr, "\n[main] SIGINT received, shutting down...\n");
         g_bus->alive.store(false, std::memory_order_release);
+        // write() is async-signal-safe, fprintf is not
+        const char msg[] = "\n[main] Signal received, shutting down...\n";
+        (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
     }
 }
 
@@ -169,8 +172,10 @@ int main(int argc, char** argv) {
         set_thread_priority(t3, 80);
         fprintf(stderr, "[main] T3 (Actuation) started, waiting for first IMU...\n");
         // Wait for first IMU packet (up to 3 seconds)
+        // Use seqlock to safely read timestamp from T3's writes
         for (int i = 0; i < 300 && bus->alive.load(); i++) {
-            if (bus->imu.timestamp_us > 0) break;
+            imu_sample_t imu = seqlock_read(bus->imu_lock, bus->imu);
+            if (imu.timestamp_us > 0) break;
             sleep_until_us(now_us() + 10000);
         }
     }
