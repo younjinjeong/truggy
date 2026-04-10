@@ -1,0 +1,121 @@
+name: Build Verification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'third_party/**'
+      - 'firmware/**'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'third_party/**'
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Check that C++/CUDA code compiles (without GPU hardware)
+  build-check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            build-essential \
+            libeigen3-dev \
+            libyaml-cpp-dev \
+            zlib1g-dev
+
+      # Install CUDA toolkit (headers + nvcc for compilation check)
+      - name: Install CUDA toolkit
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update
+          sudo apt-get install -y cuda-toolkit-12-2
+          echo "/usr/local/cuda-12.2/bin" >> $GITHUB_PATH
+
+      - name: Configure (compile check only, no ZED/TensorRT)
+        run: |
+          cmake -B build \
+            -DTARGET_NANO_2GB=ON \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DBUILD_WITHOUT_HARDWARE_DEPS=ON
+        # BUILD_WITHOUT_HARDWARE_DEPS skips ZED SDK and TensorRT find_package
+        # so we can verify core C++/CUDA compilation on CI without these SDKs
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Upload compile_commands.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-commands
+          path: build/compile_commands.json
+
+  # Lint check (clang-tidy on non-CUDA files)
+  lint:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install clang-tidy
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy-15
+
+      - name: Run clang-tidy on common/ headers
+        run: |
+          # Check style on non-CUDA header files
+          find src/common -name '*.h' -o -name '*.cpp' | \
+            xargs clang-tidy-15 \
+              --checks='bugprone-*,performance-*,readability-identifier-naming' \
+              --config-file=.clang-tidy \
+              -p build/ 2>&1 || true
+        # Non-fatal for now — enable as errors when codebase stabilizes
+
+  # Arduino firmware compile check
+  firmware-check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    # Only run if firmware files changed
+    if: contains(github.event.pull_request.title, 'firmware') || contains(join(github.event.pull_request.labels.*.name, ','), 'firmware')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          export PATH="$PATH:$PWD/bin"
+          arduino-cli core install arduino:avr
+          # Install BNO085 library
+          arduino-cli lib install "Adafruit BNO08x"
+
+      - name: Compile firmware
+        run: |
+          export PATH="$PATH:$PWD/bin"
+          arduino-cli compile --fqbn arduino:avr:uno firmware/truggy_bridge/

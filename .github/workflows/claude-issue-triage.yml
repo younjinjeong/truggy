@@ -1,0 +1,59 @@
+name: Claude Issue Triage
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+jobs:
+  triage-issue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: >-
+      github.event_name == 'issues' ||
+      (github.event_name == 'issue_comment' && !github.event.issue.pull_request && github.event.comment.user.type != 'Bot')
+    concurrency:
+      group: issue-triage-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+      issues: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Claude Code for Issue Triage
+        timeout-minutes: 5
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          allowed_non_write_users: "*"
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_args: "--model claude-sonnet-4-5-20250929"
+          prompt: |
+            Triage this GitHub issue for the TruggyAD project (autonomous driving 1/8 RC car).
+
+            Issue #${{ github.event.issue.number }} in ${{ github.repository }}
+
+            Apply appropriate labels from this set:
+            - epic: Epic-level tracking issue
+            - story: Implementation story under an epic
+            - bug: Something isn't working
+            - enhancement: New feature or request
+            - infra: Build system, CI/CD, tooling
+            - firmware: Arduino/MCU firmware
+            - perception: Camera, segmentation, costmap
+            - planning: MPPI controller, dynamics, costs
+            - state-estimation: EKF, sensor fusion
+            - integration: System integration, simulation, testing
+            - devtools: Developer skills, LSP, toolchain
+            - documentation: Documentation improvements
+            - question: Further information is requested
+
+            Use `gh issue edit ${{ github.event.issue.number }} --add-label <label>` to add labels.
+            If this is a duplicate, comment with the duplicate issue number.

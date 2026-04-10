@@ -1,0 +1,80 @@
+name: "Stale Issue Management"
+
+on:
+  schedule:
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+concurrency:
+  group: stale-issue-sweep
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark and close stale issues
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const LIFECYCLE = {
+              'needs-info': { days: 7, closeMessage: 'Closing: no response after 7 days. Reopen with the requested info.' },
+              'needs-repro': { days: 7, closeMessage: 'Closing: no reproduction steps provided after 7 days. Reopen with repro steps.' },
+              'stale': { days: 14, closeMessage: 'Closing: no activity for 14 days after being marked stale.' },
+            };
+            const STALE_UPVOTE_THRESHOLD = 5;
+
+            let totalClosed = 0;
+            const now = new Date();
+
+            for (const [label, config] of Object.entries(LIFECYCLE)) {
+              const { data: issues } = await github.rest.issues.listForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                labels: label,
+                sort: 'updated',
+                direction: 'asc',
+                per_page: 50
+              });
+
+              for (const issue of issues) {
+                // Skip issues with many upvotes
+                if (issue.reactions['+1'] >= STALE_UPVOTE_THRESHOLD) continue;
+                // Skip assigned issues
+                if (issue.assignees && issue.assignees.length > 0) continue;
+                // Skip epics
+                if (issue.labels.some(l => l.name === 'epic')) continue;
+
+                const updatedAt = new Date(issue.updated_at);
+                const daysSinceUpdate = (now - updatedAt) / (1000 * 60 * 60 * 24);
+
+                if (daysSinceUpdate >= config.days) {
+                  try {
+                    await github.rest.issues.createComment({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      body: config.closeMessage
+                    });
+
+                    await github.rest.issues.update({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: issue.number,
+                      state: 'closed',
+                      state_reason: 'not_planned'
+                    });
+
+                    totalClosed++;
+                    console.log(`Closed #${issue.number} (${label}, ${Math.round(daysSinceUpdate)}d): ${issue.title}`);
+                  } catch (error) {
+                    console.error(`Failed to close #${issue.number}: ${error.message}`);
+                  }
+                }
+              }
+            }
+
+            console.log(`Total issues closed: ${totalClosed}`);

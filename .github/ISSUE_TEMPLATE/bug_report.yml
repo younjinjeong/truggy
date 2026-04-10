@@ -1,0 +1,79 @@
+name: Bug Report
+description: Report a bug in TruggyAD
+title: "[BUG] "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the bug
+      placeholder: |
+        The MPPI controller outputs NaN steering values after running for 30 seconds...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: The controller should output valid steering values in [-0.99, 0.99]
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Build with `cmake -B build -DTARGET_NANO_2GB=ON`
+        2. Run `./build/truggy --config config/truggy.yaml`
+        3. Wait 30 seconds
+        4. Observe NaN values in steering output
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output / logs
+      render: shell
+    validations:
+      required: false
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Perception (ZED, segmentation, costmap)
+        - Planning (MPPI, dynamics, costs)
+        - State Estimation (EKF)
+        - Actuation (Arduino, serial)
+        - Build System (CMake, CUDA)
+        - Infrastructure (config, timing, types)
+        - Simulation (Gazebo)
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Hardware platform
+      options:
+        - Jetson Nano 2GB
+        - Jetson Orin Nano Super
+        - WSL2 (cross-compile)
+        - Gazebo simulation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Screenshots, tegrastats output, config files, etc.
+    validations:
+      required: false
